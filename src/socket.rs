@@ -14,13 +14,19 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+#[derive(Clone, Copy)]
+enum BindKind {
+    Exact(SocketAddr),
+    Wildcard(Option<IpAddr>),
+}
+
 /// A TCP socket server, listening for connections.
 ///
 /// You can accept a new connection by using the accept method.
 pub struct TcpListener {
     handle: SocketHandle,
     reactor: Arc<Reactor>,
-    local_addr: SocketAddr,
+    bind_kind: BindKind,
 }
 
 fn map_err<E: std::error::Error>(e: E) -> io::Error {
@@ -42,7 +48,24 @@ impl TcpListener {
         Ok(TcpListener {
             handle,
             reactor,
-            local_addr,
+            bind_kind: BindKind::Exact(local_addr),
+        })
+    }
+
+    pub(super) async fn new_any(
+        reactor: Arc<Reactor>,
+        local_addr: Option<IpAddr>,
+    ) -> io::Result<TcpListener> {
+        let handle = reactor.socket_allocator().new_tcp_socket();
+        {
+            let mut socket = reactor.get_socket::<tcp::Socket>(*handle);
+            socket.listen_any(local_addr.map(Into::into)).map_err(map_err)?;
+        }
+
+        Ok(TcpListener {
+            handle,
+            reactor,
+            bind_kind: BindKind::Wildcard(local_addr),
         })
     }
     pub fn poll_accept(
@@ -65,7 +88,13 @@ impl TcpListener {
         Incoming(self)
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local_addr)
+        match self.bind_kind {
+            BindKind::Exact(addr) => Ok(addr),
+            BindKind::Wildcard(_) => Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "wildcard tcp listener does not map to a single local socket address",
+            )),
+        }
     }
 }
 
@@ -137,7 +166,12 @@ impl TcpStream {
         let new_handle = reactor.socket_allocator().new_tcp_socket();
         {
             let mut new_socket = reactor.get_socket::<tcp::Socket>(*new_handle);
-            new_socket.listen(listener.local_addr).map_err(map_err)?;
+            match listener.bind_kind {
+                BindKind::Exact(addr) => new_socket.listen(addr).map_err(map_err)?,
+                BindKind::Wildcard(addr) => {
+                    new_socket.listen_any(addr.map(Into::into)).map_err(map_err)?
+                }
+            }
         }
         let (peer_addr, local_addr) = {
             let socket = reactor.get_socket::<tcp::Socket>(*listener.handle);
@@ -188,9 +222,6 @@ impl AsyncRead for TcpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut socket = self.reactor.get_socket::<tcp::Socket>(*self.handle);
-        if !socket.may_recv() {
-            return Poll::Ready(Ok(()));
-        }
         if socket.can_recv() {
             let read = socket
                 .recv_slice(buf.initialize_unfilled())
@@ -199,6 +230,19 @@ impl AsyncRead for TcpStream {
             buf.advance(read);
             return Poll::Ready(Ok(()));
         }
+
+        match socket.recv_slice(&mut []) {
+            Ok(0) => {}
+            Ok(_) => unreachable!("zero-length read probe should not dequeue data"),
+            Err(tcp::RecvError::Finished) => return Poll::Ready(Ok(())),
+            Err(tcp::RecvError::InvalidState) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "tcp stream closed",
+                )));
+            }
+        }
+
         socket.register_recv_waker(cx.waker());
         Poll::Pending
     }
@@ -237,7 +281,13 @@ impl AsyncWrite for TcpStream {
             socket.close();
             self.reactor.notify();
         }
-        if socket.state() == tcp::State::Closed {
+        // `AsyncWrite::poll_shutdown` models closing the local write half.
+        // Waiting for the full TCP state machine to reach `Closed` is too strict:
+        // after `close()`, smoltcp transitions to `FIN-WAIT-1`/`LAST-ACK` and may
+        // stay there until the peer fully tears down the connection. Higher-level
+        // helpers such as `tokio::io::copy_bidirectional` expect shutdown to
+        // complete once no further local writes are possible.
+        if !socket.may_send() || socket.state() == tcp::State::Closed {
             return Poll::Ready(Ok(()));
         }
 
@@ -250,7 +300,7 @@ impl AsyncWrite for TcpStream {
 pub struct UdpSocket {
     handle: SocketHandle,
     reactor: Arc<Reactor>,
-    local_addr: SocketAddr,
+    bind_kind: BindKind,
 }
 
 impl UdpSocket {
@@ -268,7 +318,23 @@ impl UdpSocket {
         Ok(UdpSocket {
             handle,
             reactor,
-            local_addr,
+            bind_kind: BindKind::Exact(local_addr),
+        })
+    }
+    pub(super) async fn new_any(
+        reactor: Arc<Reactor>,
+        local_addr: Option<IpAddr>,
+    ) -> io::Result<UdpSocket> {
+        let handle = reactor.socket_allocator().new_udp_socket();
+        {
+            let mut socket = reactor.get_socket::<udp::Socket>(*handle);
+            socket.bind_any(local_addr.map(Into::into)).map_err(map_err)?;
+        }
+
+        Ok(UdpSocket {
+            handle,
+            reactor,
+            bind_kind: BindKind::Wildcard(local_addr),
         })
     }
     /// Note that on multiple calls to a poll_* method in the send direction, only the Waker from the Context passed to the most recent call will be scheduled to receive a wakeup.
@@ -304,6 +370,14 @@ impl UdpSocket {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        self.poll_recv_from_full(cx, buf)
+            .map_ok(|(size, _local, remote)| (size, remote))
+    }
+    pub fn poll_recv_from_full(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr, SocketAddr)>> {
         let mut socket = self.reactor.get_socket::<udp::Socket>(*self.handle);
 
         match socket.recv_slice(buf) {
@@ -312,7 +386,14 @@ impl UdpSocket {
             r => {
                 let (size, metadata) = r.map_err(map_err)?;
                 self.reactor.notify();
-                return Poll::Ready(Ok((size, ep2sa(&metadata.endpoint))));
+                let local_ip = metadata.local_address.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::AddrNotAvailable, "udp metadata missing local address")
+                })?;
+                let local_port = metadata.local_port.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::AddrNotAvailable, "udp metadata missing local port")
+                })?;
+                let local = ep2sa(&IpEndpoint::new(local_ip, local_port));
+                return Poll::Ready(Ok((size, local, ep2sa(&metadata.endpoint))));
             }
         }
 
@@ -323,8 +404,48 @@ impl UdpSocket {
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         poll_fn(|cx| self.poll_recv_from(cx, buf)).await
     }
+    pub async fn recv_from_full(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+        poll_fn(|cx| self.poll_recv_from_full(cx, buf)).await
+    }
+    pub fn poll_send_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        local: SocketAddr,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let mut socket = self.reactor.get_socket::<udp::Socket>(*self.handle);
+        match socket.send_slice_with_local(buf, target, local.into()) {
+            Err(udp::SendError::BufferFull) => {}
+            r => {
+                r.map_err(map_err)?;
+                self.reactor.notify();
+                return Poll::Ready(Ok(buf.len()));
+            }
+        }
+
+        socket.register_send_waker(cx.waker());
+        Poll::Pending
+    }
+    pub async fn send_from(
+        &self,
+        buf: &[u8],
+        local: SocketAddr,
+        target: SocketAddr,
+    ) -> io::Result<usize> {
+        poll_fn(|cx| self.poll_send_from(cx, buf, local, target)).await
+    }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local_addr)
+        match self.bind_kind {
+            BindKind::Exact(addr) => Ok(addr),
+            BindKind::Wildcard(_) => Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "wildcard udp socket does not map to a single local socket address",
+            )),
+        }
     }
 }
 

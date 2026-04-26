@@ -38,6 +38,11 @@ pcap = "1.0.0"
 structopt = "0.3"
 dns-parser = "0.8"
 rand = "0.9"
+tun2 = { version = "4", features = ["async"] }
+log = "0.4"
+env_logger = "0.11"
+socket2 = "0.5"
+socket2-ext = "0.1.1"
 
 [features]
 default = ["proto-ipv4", "proto-ipv6", "raw_socket"]
@@ -45,5 +50,12 @@ proto-ipv4 = ["smoltcp/proto-ipv4"]
 proto-ipv6 = ["smoltcp/proto-ipv6"]
 raw_socket = ["smoltcp/socket-raw"]
 
+[patch.crates-io]
+smoltcp = { path = "../smoltcp" }
+
 [[example]]
 name = "pcap"
+
+[[example]]
+name = "traffic-echo-server"
+path = "examples/traffic-echo-server/main.rs"

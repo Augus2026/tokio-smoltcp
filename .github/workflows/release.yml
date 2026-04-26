@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create or update, for example v0.6.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  EXAMPLE_NAME: transparent-proxy
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+            archive_ext: zip
+          - asset_name: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            use_cross: false
+            archive_ext: zip
+          - asset_name: linux-amd64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+            archive_ext: tar.gz
+          - asset_name: linux-arm64
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+            archive_ext: tar.gz
+          - asset_name: macos-amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            use_cross: false
+            archive_ext: tar.gz
+          - asset_name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        shell: pwsh
+        run: |
+          if ("${{ matrix.use_cross }}" -eq "true") {
+            cross build --release --example $env:EXAMPLE_NAME --target ${{ matrix.target }}
+          } else {
+            cargo build --release --example $env:EXAMPLE_NAME --target ${{ matrix.target }}
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $target = "${{ matrix.target }}"
+          $assetName = "${{ matrix.asset_name }}"
+          $archiveExt = "${{ matrix.archive_ext }}"
+          $binaryName = $env:EXAMPLE_NAME
+          if ($IsWindows) {
+            $binaryName = "$binaryName.exe"
+          }
+
+          $binaryPath = Join-Path "target/$target/release/examples" $binaryName
+          if (!(Test-Path $binaryPath)) {
+            throw "Binary not found: $binaryPath"
+          }
+
+          $distDir = Join-Path "dist" $assetName
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          Copy-Item $binaryPath (Join-Path $distDir $binaryName)
+
+          $archiveName = "$($env:EXAMPLE_NAME)-$assetName.$archiveExt"
+          $archivePath = Join-Path "dist" $archiveName
+
+          if ($archiveExt -eq "zip") {
+            Compress-Archive -Path (Join-Path $distDir "*") -DestinationPath $archivePath -Force
+          } else {
+            tar -czf $archivePath -C $distDir .
+          }
+
+          "archive_path=$archivePath" >> $env:GITHUB_ENV
+          "archive_name=$archiveName" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.archive_name }}
+          path: ${{ env.archive_path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          generate_release_notes: true

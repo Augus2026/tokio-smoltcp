@@ -2,7 +2,7 @@
 
 use std::{
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU16, Ordering},
@@ -136,6 +136,17 @@ impl Net {
         TcpListener::new(self.reactor.clone(), endpoint, addr).await
     }
 
+    /// Creates a new TcpListener that passively accepts TCP connections for any destination port.
+    pub async fn tcp_bind_all(&self) -> io::Result<TcpListener> {
+        TcpListener::new_any(self.reactor.clone(), None).await
+    }
+
+    /// Creates a new TcpListener that passively accepts TCP connections for any destination port
+    /// on the specified local IP address.
+    pub async fn tcp_bind_any_ip(&self, addr: IpAddr) -> io::Result<TcpListener> {
+        TcpListener::new_any(self.reactor.clone(), Some(addr)).await
+    }
+
     /// Opens a TCP connection to a remote host.
     pub async fn tcp_connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         TcpStream::connect(
@@ -160,6 +171,15 @@ impl Net {
     pub async fn udp_bind(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
         let (addr, endpoint) = self.bind_address(addr);
         UdpSocket::new(self.reactor.clone(), endpoint, addr).await
+    }
+    /// Creates a new UdpSocket that passively receives UDP datagrams for any destination port.
+    pub async fn udp_bind_all(&self) -> io::Result<UdpSocket> {
+        UdpSocket::new_any(self.reactor.clone(), None).await
+    }
+    /// Creates a new UdpSocket that passively receives UDP datagrams for any destination port
+    /// on the specified local IP address.
+    pub async fn udp_bind_any_ip(&self, addr: IpAddr) -> io::Result<UdpSocket> {
+        UdpSocket::new_any(self.reactor.clone(), Some(addr)).await
     }
     /// Creates a new raw socket.
     pub async fn raw_socket(
@@ -222,7 +242,7 @@ impl Drop for Net {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{Sink, SinkExt, Stream};
+    use futures::{Sink, Stream};
     use smoltcp::{
         phy::{DeviceCapabilities, Medium},
         socket::Socket,
@@ -230,12 +250,14 @@ mod tests {
     use std::{
         io,
         pin::Pin,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
         task::{Context, Poll},
         time::Duration as StdDuration,
+    };
+
+    #[cfg(unix)]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     #[derive(Clone)]
@@ -372,6 +394,18 @@ mod tests {
         assert!(
             socket.local_addr().unwrap().ip().is_unspecified(),
             "wildcard udp bind should preserve an unspecified local address",
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_bind_all_returns_listener_without_single_local_addr() {
+        let (net, _fut) = Net::new2(PendingDevice { caps: ip_caps() }, test_config());
+
+        let listener = net.tcp_bind_all().await.unwrap();
+
+        assert_eq!(
+            listener.local_addr().unwrap_err().kind(),
+            io::ErrorKind::AddrNotAvailable,
         );
     }
 
